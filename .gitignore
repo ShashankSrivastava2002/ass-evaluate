@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# API keys and credentials
+*.pem
+*.key
+secrets/
+secret.txt
+
+# IDEs
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build files
+build/
+dist/
+*.egg-info/
+
+# Logs
+*.log
+
+Important: .gitignore only prevents files froai-agent-security-multi-step-tool-attacks/aicomp_sdk/fixtures/file_seed/secret.txt
+ai-agent-security-multi-step-tool-attacks/aicomp_sdk/fixtures/file_seed/secret.txt
+__pycache__/
+*.pyc
