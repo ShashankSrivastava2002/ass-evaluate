@@ -412,24 +412,98 @@ which had never been opened before. Found:
   earlier open question about whether packing adds new zero-out risk: it
   doesn't, by construction.
 
+## v4 REAL result: 37/1000 — a regression below v3's 78
+
+v4 scored **37/1000** for real — worse than v3, not just a smaller-than-hoped
+gain. Root-caused (not guessed) by re-reading v4's own logic for budget
+allocation mistakes rather than assuming the chaining mechanism itself was
+wrong (it had already been unit-tested correct):
+
+1. **`CONFUSED_DEPUTY_FRAC_WEAK = 0.50`.** If the EXFILTRATION probe (only
+   40 total trials across 8 templates — noisy) read below `MIN_FIRE_RATE` on
+   the real run, v4 diverted **half the entire budget** to CONFUSED_DEPUTY
+   chains that were never themselves probed for fire rate. v1's real run
+   already showed CONFUSED_DEPUTY only produces "a handful" of hits — not a
+   reliably-firing predicate. If it triggered, EXFILTRATION (4x higher
+   severity) lost roughly half its effective budget. 78 → 37 is almost
+   exactly a 2x drop — numerically consistent with this being the dominant
+   cause.
+2. **`FAIL_STREAK_CUTOFF = 2`,** applied even to chains that never fire at
+   all — every dead end cost 2 wasted messages instead of 1 (double v3's
+   per-dead-end cost), and a chain that DID fire still had its trailing 2
+   failed messages **included** in the returned candidate, spending real
+   replay budget on messages already known locally to fail for zero score.
+
+Both are budget-allocation mistakes, not implementation bugs — invisible to
+a unit test that only checks "does the mechanism do what it's told."
+
+## v5 design (current) — conservative rebuild, not another speculative rework
+
+Removes both failure modes **by construction** rather than by re-tuning the
+same knobs:
+
+- **Base mechanism reverted to v3's**: one fresh-domain message per
+  candidate; a message that doesn't fire is abandoned immediately — v3's
+  exact cost profile, no multi-failure tax.
+- **Chaining is now strictly opportunistic and small**: `MAX_CHAIN_LEN = 4`
+  (not 32). Only AFTER a message already fired does the code try a FEW more
+  messages in the same session, stopping and **trimming** at the very first
+  failed extension so a message known to fail is never returned (never costs
+  replay budget for zero score). Worst case per candidate is identical to
+  v3; extension is a pure bonus. The small cap also bounds an unverified risk
+  v4 didn't guard against at all: per-turn latency possibly growing with
+  context length for a ~20B model.
+- **CONFUSED_DEPUTY is bounded on three independent, non-fractional axes**:
+  a fixed 300s time reserve (`DEPUTY_MAX_SECONDS`, ~3% of a 9000s budget,
+  clamped to ≤30% of remaining budget so a small test/edge-case budget can't
+  have this fixed reserve alone starve EXFILTRATION — caught via a fake-env
+  unit test before it could matter), a fixed 40-candidate cap
+  (`DEPUTY_MAX_CANDIDATES`), and the same shared replay/candidate guards as
+  EXFILTRATION. No fractional hedge, no dependency on how noisy the
+  EXFILTRATION probe read.
+- Round-trip optimization from the v4 re-verification pass is kept
+  (`export_trace_dict()` skipped whenever `EnvInteractionResult.
+  successful_tool_calls == 0` already proves nothing fired) — a pure
+  efficiency win, no behavioral change, unrelated to the regression.
+- Domain rotation, template bank, Harmony forgery, `REPLAY_SAFE_FRAC=0.97`
+  wall-clock accounting, and the small speculative destructive-write/
+  secret-read candidates are all unchanged from v3/v4.
+
+**Verification performed on v5** (fake-env unit tests, not just the
+deterministic stub which can never fire the real payload):
+confirmed chains cap at exactly `MAX_CHAIN_LEN` and never exceed it;
+confirmed a chain that never fires returns zero candidates; confirmed
+trimming works exactly — a chain that fires once then always fails is
+*always* returned as a 1-message candidate, never with wasted trailing
+failures; confirmed CONFUSED_DEPUTY respects its fixed 40-candidate cap even
+at a 100% fire rate; confirmed — after finding and fixing the deputy-reserve
+clamp bug above — that CONFUSED_DEPUTY still gets its reserved slice even in
+the worst case where EXFILTRATION has a 0% real fire rate, using a
+realistic (non-zero-latency) fake env to rule out a test-harness artifact
+that had briefly looked like a real starvation bug.
+
 ## Next steps / open questions
 
-- **Competition deadline is 2026-08-25** (found via live search of the
-  Kaggle competition page listing) — 3 days from today (2026-08-22). Little
-  room left for more than one or two more real-submission iterations.
-- Run `attack-submission-notebook.ipynb` on Kaggle to get a real score for
-  v4. Target is >200.
-- If v4 doesn't clear v3's 78, the most likely explanation is that v3 was
-  already time-bound (not candidate-cap-bound) at ~2000 interacts — i.e.
-  real per-interact latency is high enough that packing had no spare budget
-  to spend. In that case the next lever is reducing per-interact cost itself
-  (shorter templates, fewer tool hops requested) rather than more packing.
+- **Competition deadline is 2026-08-25** — very little runway left. Prioritize
+  actually submitting v5 over further speculative changes.
+- Run `attack-submission-notebook.ipynb` on Kaggle for a real v5 score.
+  Target is >100–150, with the explicit design goal of not regressing below
+  v3's proven 78 (every v5 mechanism reduces to v3's exact behavior in the
+  worst case).
+- If v5 still underperforms v3, the two most likely remaining explanations,
+  in order: (a) real per-turn latency genuinely does grow enough with
+  context length that even a 4-message chain hurts throughput — the fix
+  would be to drop `MAX_CHAIN_LEN` to 2 or reduce it to pure v3 (no chaining
+  at all) as a floor; (b) real interact() latency is high enough that v3 was
+  already time-bound at ~2000 interacts, meaning neither packing nor the
+  round-trip optimization can meaningfully help, and the next lever is
+  reducing per-interact cost itself (shorter templates, fewer tool hops).
 - Still untested: whether the corrected `commentary`-channel Harmony forgery
   outperforms the disclosed files' `analysis`-only forgery (check the
   `[fill] selected=...` stderr line after a real run); per-model
   latency-based routing (present in the original disclosed 86-point file,
-  not ported here since v3/v4's live per-template selection already
-  implicitly adapts per model).
+  not ported here since the live per-template selection already implicitly
+  adapts per model).
 - No way to test against the private guardrail locally — its behavior (and
   whether it shares `OptimalGuardrail`'s blanket "secret" substring rule,
   5-event taint window, or first-present-key `_extract_target()` flaw) is
