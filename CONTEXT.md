@@ -482,28 +482,98 @@ the worst case where EXFILTRATION has a 0% real fire rate, using a
 realistic (non-zero-latency) fake env to rule out a test-harness artifact
 that had briefly looked like a real starvation bug.
 
+## v5 real result: 68/1000 — better than v4, still below v3's 78
+
+v5 scored **68/1000** for real. Better than v4's 37, but still a regression
+relative to v3's 78, and nowhere near the disclosed 81/87/90-point files
+(see below). This ruled out "chaining implemented badly" (v4's actual bugs
+were fixed) as the explanation and pointed at "chaining is the wrong lever
+for this contract" instead — confirmed by what was found next.
+
+## Reference files found in repo root: 81/87/90-point disclosed real scores
+
+`81_point.ipynb`, `87_point.ipynb`, `90_point.ipynb` at the repo root are
+real Kaggle-scored submissions for this exact contract, scoring 81, 87, and
+90/1000 respectively. All three share one property v4/v5 abandoned:
+**every returned `AttackCandidate` is exactly one message** — none of them
+chain. The 90-point file in particular is a mature, heavily-iterated design
+(its docstring documents ~15 real submission cycles between 2026-07-06 and
+2026-07-21) implementing:
+
+- **Untimed warm-up** `env.interact()` call before the deadline clock
+  starts, so cold model-load latency (75–146s) never falsely inflates the
+  "slowest observed call" estimate.
+- **Per-model split by OBSERVED latency** (never by identity — `run()` is
+  never told which model it's talking to): classify the first N candidates
+  by mean latency vs. a threshold, then commit the rest of the run to one
+  template — Harmony analysis-channel forging for the slow/reasoning row,
+  plain verbose imperative for the fast row.
+- **Live validation-fill**: generate one candidate, replay it against the
+  live env immediately, keep it ONLY if it fired. 100% of returned
+  candidates provably fire, vs. v3/v4/v5's probe-then-blind-emit where only
+  a small probe sample's fire rate is known.
+- **Replay-safe sizing**: since the fill already runs each candidate at the
+  grader's own `max_tool_hops`, the measured elapsed time per kept candidate
+  IS its real replay cost. Track cumulative cost and stop before exceeding
+  `REPLAY_SAFE_FRAC` (0.98 in the actual scoring config) of the budget,
+  rather than a flat time margin.
+
+The file also carries several experimental toggles (`BURST_K` multi-post,
+`SLOW_MULTIPOST_N` Harmony-forged multi-endpoint planning, `PROBE_HOPS`
+scaling, `REPLAY_BUDGET_MULT`) that were all left at their no-op default in
+the "variant override" block that actually produced the 90 score — i.e. the
+90-point result came from the simpler mechanism above, not the extra
+toggles.
+
+## v6 design (current) — adopt the disclosed 90-point recipe directly
+
+Given v3 (no chaining) > v4/v5 (chaining), and all three disclosed real
+81/87/90-point runs (no chaining) > v3, the chaining direction itself was
+the wrong lever — not a tuning problem. v6 drops chaining and the
+CONFUSED_DEPUTY hedge entirely and reimplements the mechanism above,
+verified against the current bundled SDK (`export_trace_dict()` dict-key
+shapes, `AttackAlgorithmBase`/`AttackCandidate`/`AttackRunConfig` from
+`aicomp_sdk.attacks.contracts`, `AttackEnvProtocol` from
+`aicomp_sdk.core.env.api` — all confirmed present and matching). Dropped the
+no-op experimental toggles entirely rather than porting them switched off,
+to minimize surface area for a new bug.
+
+Verified locally via: `aicomp validate redteam attack.py` (passes),
+`aicomp test redteam attack.py --agent deterministic` (0 findings — CONFIRMED
+non-diagnostic: the same command against the last real-scored v5 also
+returns 0 findings, since the deterministic stub agent never actually calls
+`http.post` with our payload; this environment has no cached model weights
+or API key for `--agent gemma`/`gpt_oss`/`openai`, so a locally-measured real
+fire rate isn't available — same limitation as every prior version), and
+hand-built fake-env tests confirming: `env is None` and `n_candidates`
+override fallback paths, never-fires → blind fallback, always-fires →
+unique non-duplicate candidates respecting the 32-message/2000-char/2000-
+candidate SDK limits, per-model latency classification correctly switches to
+`FRAME_TEMPLATE` above the 12s threshold and stays on `TEMPLATE` below it,
+and replay-safe sizing stops before exceeding the run's own wall-clock
+budget under a controlled fake clock.
+
 ## Next steps / open questions
 
-- **Competition deadline is 2026-08-25** — very little runway left. Prioritize
-  actually submitting v5 over further speculative changes.
-- Run `attack-submission-notebook.ipynb` on Kaggle for a real v5 score.
-  Target is >100–150, with the explicit design goal of not regressing below
-  v3's proven 78 (every v5 mechanism reduces to v3's exact behavior in the
-  worst case).
-- If v5 still underperforms v3, the two most likely remaining explanations,
-  in order: (a) real per-turn latency genuinely does grow enough with
-  context length that even a 4-message chain hurts throughput — the fix
-  would be to drop `MAX_CHAIN_LEN` to 2 or reduce it to pure v3 (no chaining
-  at all) as a floor; (b) real interact() latency is high enough that v3 was
-  already time-bound at ~2000 interacts, meaning neither packing nor the
-  round-trip optimization can meaningfully help, and the next lever is
-  reducing per-interact cost itself (shorter templates, fewer tool hops).
-- Still untested: whether the corrected `commentary`-channel Harmony forgery
-  outperforms the disclosed files' `analysis`-only forgery (check the
-  `[fill] selected=...` stderr line after a real run); per-model
-  latency-based routing (present in the original disclosed 86-point file,
-  not ported here since the live per-template selection already implicitly
-  adapts per model).
+- **Note on the deadline**: earlier notes in this file said the entry
+  deadline was 2026-08-25; today's date is 2026-08-26. If that date is
+  actually the *final* submission deadline (not just an "accept rules by"
+  date) this may already be closed — worth the user double-checking the
+  actual Kaggle competition page rather than trusting this file's stale
+  note.
+- Submit `attack-submission-notebook.ipynb` (v6) on Kaggle for a real score.
+  Given it's a near-direct port of the disclosed 90-point recipe, the
+  realistic target is close to 90, not v5's 68.
+- If v6 underperforms the disclosed 90, the likely culprits, in order to
+  check: (a) `SPLIT_THRESHOLD_S = 12.0` misclassifying a model on the
+  current live grader (check candidate count and infer which template won —
+  no debug print was added in v6 since the 90-point source didn't have one
+  either; consider adding one before the next iteration if a real score
+  comes back low with no way to diagnose why); (b) the guardrail deployed
+  today differs from what the 90-point run faced (only same-repo evidence
+  available is `OptimalGuardrail`'s first-present-key `_extract_target()`
+  flaw and blanket "secret" substring rule — unknown whether the private
+  grader's guardrail matches).
 - No way to test against the private guardrail locally — its behavior (and
   whether it shares `OptimalGuardrail`'s blanket "secret" substring rule,
   5-event taint window, or first-present-key `_extract_target()` flaw) is
